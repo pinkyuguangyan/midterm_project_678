@@ -1,0 +1,574 @@
+---
+title: "report"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,message=FALSE,fig.align="center")
+pacman::p_load("ggplot2", "knitr", "tidyverse", "magrittr", update = FALSE)
+```
+#Abstract
+With increasing development of digital music database, automatic music recommendation has become an increasingly relevant problem in recent years. Most recommender systems rely on collaborative filtering, which based on users’ interests without considering the content information of music. I try to combine both information of users and music, so that for new songs, I can determine the probability of recommendation based on its musical features like genres. In this paper, the problem I focused on is to predict whether a user will listend to a song repeatedly. The EDA part shows the overview of the whole data and the process I choosing demographic and musical features. In the model part, I fit logistic regression and multilevel logistic regression with the variables I choosed by EDA and get similar result. Both of them get 0.65 AUC score.
+
+#1. Introduction
+For music application company, apparently better recommendation system can attract more users. For example, “NeteaseMusic” has a high-quality music recommendation for users everyday, and a lot of people use this music app because of its accurate recommendation. To recommend personally, there are three main types of recommendation models used by companies: 1. Collaborative Filtering models (i.e. the ones that Last.fm originally used), which analyze both your behavior and others’ behaviors. 2. Natural Language Processing (NLP) models, which analyze text. 3. Audio models, which analyze the raw audio tracks themselves. In this paper, I just do the simple linear regresson to fit the data.
+
+#2. Method
+##2.1 Data source
+The dataset is from KKBOX, Asia’s leading music streaming service, holding the world’s most comprehensive Asia-Pop music library with over 30 million tracks.
+
+####song-user.csv
+* msno: user id
+* song_id: song id
+* source_system_tab: the name of the tab where the event was triggered. System tabs are used to categorize KKBOX mobile apps functions. For example, tab "my library" contains functions to manipulate the local storage, and tab "search" contains functions relating to search.
+* source_screen_name: name of the layout a user sees.
+* source_type: an entry point a user first plays music on mobile apps. An entry point could be album, online-playlist, song .. etc.
+* target: this is the target variable. target=1 means there are recurring listening event(s) triggered within a month after the user’s very first observable listening event, target=0 otherwise.
+
+####songs.csv
+* song_id
+* song_length: in ms
+* genre_ids: genre category. Some songs have multiple genres and they are separated by |
+* artist_name
+* composer
+* lyricist
+* language
+* members.csv
+* user information.
+
+####msno
+* city
+* bd: age. Note: this column has outlier values, please use your judgement.
+* gender
+* registered_via: registration method
+* registration_init_time: format %Y%m%d
+* expiration_date: format %Y%m%d
+
+###2.1.1 Overview
+* "target" in song-user data is my response. 
+* There are 27179 users in the song-user dataset(around 700,0000 observations), everyone has different number of history data. I seperate the data in train set and test setn by 3:1. 
+* There are 20468 overlapping users in train and test set, which means that 85% users in test data set are old users.
+* There are 2481398 user-song pairs of no-repeated; 2896020 user-song pairs of repeated, which means that the data of two groups(repeat and non repeat) has no bias.
+* There are 294637 unique songs in train dataset, and 47 of them do not have data in "song.csv", so I removed them from test set.
+* There are 147 unique genres in the songs with single genre, contains unknown genre, and 385 mixed genres. Only 83 observations in test set has new genre_ids, I removed them.
+
+###2.1.2 EDA
+####msno(user_id)
+I assume that every user has his or her own habit, which means some users prefer to listen to songs repeatedly while others not. So I see the distribution of listening repeatedly probability to find if there is difference between users.
+```{r}
+load("train.RData")
+user_p<-train %>%
+  group_by(msno) %>%
+  summarise(p=mean(target))
+ggplot(user_p) + geom_histogram(aes(x=p),fill="orange",bins=20) + 
+  labs(title = "probability of listening repeatedly distribution",
+       x = "probability",
+       y = "count of users",
+       tag = "fig.1")
+```
+*The distribution plot shows that users have individual habit, a great number of users will not listen to songs repeatedly, but someone tend to listen to songs repeatedly.*
+
+*msno(user_id) can be a predictor for target. For multilevel model, group by msno(user_id) is sensible.*
+
+####Times a song played
+```{r}
+validation<-train[(dim(train)[1]-1999999):dim(train)[1],]
+train<-train[1:(dim(train)[1]-2000000),]
+train_song<-train %>%
+  group_by(song_id) %>%
+  mutate(count = n()) %>%
+  group_by(count) %>%
+  summarise(p=mean(target))
+
+ggplot(train_song) + geom_point(aes(x=log(count),y=p),color = "skyblue") +
+  labs(title = "times a song played & probability of listened repeatedly",
+       x = "log(Times a song played)",
+       y = "Probability of listened repeatedly",
+       tag = "fig.2")
+
+```
+*The plot shows that when songs are played more times, the corresponding probability of the song repeated increases. But for the songs played more than* $e^5$ *times, thoug the positive linear relationship is still exist, there is more noise than songs played less times.*
+
+*Times a song played can be a predictor for target.*
+
+```{r}
+train %<>%
+  group_by(song_id) %>%
+  mutate(song_played_times=n())
+
+validation %<>%
+  group_by(song_id) %>%
+  mutate(song_played_times=n())
+```
+####ui information
+```{r}
+train %<>%
+  filter(!source_system_tab %in% c("null",""))
+validation %<>%
+  filter(!source_system_tab %in% c("null",""))
+train %<>%
+  filter(!source_screen_name == "")
+validation %<>%
+  filter(!source_screen_name == "")
+train %<>%
+  filter(source_type != "")
+validation %<>%
+  filter(source_type != "")
+
+```
+```{r,fig.height=10,fig.width=8}
+library(gridExtra)
+#source_system_tab difference between two groups
+train_tab<-train %>%
+  group_by(source_system_tab,target) %>%
+  summarise(count=n()) %>%
+  mutate(all_count=sum(count)) %>%
+  mutate(p=count/all_count)
+train_tab_p<-train_tab %>%
+  filter(target==1) %>%
+  dplyr::select(source_system_tab,count,p) %>%
+  arrange(desc(p))
+kable(train_tab_p,caption = "number of observations and the probability of songs listened repeatedly for each ui tab")
+train_screen<-train %>%
+  group_by(source_screen_name,target) %>%
+  summarise(count=n()) %>%
+  mutate(all_count=sum(count)) %>%
+  mutate(p=count/all_count)
+train_sourcetype<-train %>%
+  group_by(source_type,target) %>%
+  summarise(count=n()) %>%
+  mutate(all_count=sum(count)) %>%
+  mutate(p=count/all_count)
+p1<-ggplot(train_tab,mapping = aes(x=source_system_tab,y=p)) + geom_bar(aes(fill=as.factor(target)),stat="Identity") + labs(title="Probability of repeated in different source_system_tab",tag = "fig.3") + scale_fill_discrete(name="target") + coord_flip()
+p2<-ggplot(train_screen,mapping = aes(x=source_screen_name,y=p)) + geom_bar(aes(fill=as.factor(target)),stat="Identity") + labs(title="Probability of repeated in different source_screen_name") + scale_fill_discrete(name="target")+ coord_flip()
+p3<-ggplot(train_sourcetype,mapping = aes(x=source_type,y=p)) + geom_bar(aes(fill=as.factor(target)),stat="Identity") + labs(title="Probability of repeated in different source_type") +
+  scale_fill_discrete(name="target")+ coord_flip()
+grid.arrange(p1, p2,p3, nrow = 3,name = "UI info with probability of listened repeatedly")
+```
+*Most songs are played from "my library" and "discover".*
+
+*The table and the bar plot shows that songs played from "my library"" are most likely to be listened reapeated, and different tabs have significant differences.* 
+
+*source_system_tab is correlated to wheather the song would be listened repeatedly.*
+
+*Also screen_name and source_type are correlated to the probability of songs listened repeatedly.*
+
+In such case, I want to see if these three UI attributes are correlated.
+
+```{r,fig.width==8,fig.height=6}
+index<-sample(dim(train)[1],10000)
+plot<-train[index,]
+ggplot(plot,aes(x = source_system_tab, 
+                                   y = source_screen_name,
+                                   color = source_type)) +
+  geom_jitter() +
+  labs(title="correlation between 3 ui variables", x = "source_system_tab", y = "source_screen_name", tag = "fig.4") 
+```
+*There are some clusters in the plot, and most points in the clusters have the same color, which means that there is some correlation in these three variables.*
+
+*So in the model, I choose "source_system_tab" from these three as a predictor.*
+
+####song length
+```{r}
+load("song.RData")
+song<-na.omit(song)
+song_id_train<-unique(train$song_id)
+#length(song_id_train) #There are 294637 songs in train dataset
+song_id_validation<-unique(validation$song_id)#188115
+
+#select songs data occured in train data and validation data
+song_train<-song %>%
+  filter(song_id %in% song_id_train)#294590 means there are 47 songs do not have data in "song.csv"
+
+song_validation<-song %>%
+  filter(song_id %in% song_id_validation)#188096 observations. means there are 19 songs do not have data in "song.csv"
+```
+```{r,warning=FALSE}
+#detect&remove outliers
+song_length_outliers<-boxplot.stats(song_train$song_length)$out
+song_train %<>%
+  filter(!song_length %in% song_length_outliers)#274284
+
+song_train_join<-inner_join(train,song_train,by="song_id")#5001462, because the 48 songs don't have song data, the train dataset has decreased from 5377418 to 5377309. difference is very small so will not influence EDA of the train dataset.
+song_validation_join<-inner_join(validation,song_validation,by="song_id")#1873028
+```
+```{r}
+#difference in song length of two groups
+ggplot(song_train_join, aes(x=song_length)) +  
+  geom_density(aes(color=as.factor(target))) +
+    labs(title = "song_length of two groups",
+       x = "song_length",
+       y = "density",
+       tag = "fig.5") +
+  scale_color_discrete(name="target")
+```
+*The density plot shows there is a little difference in song_length between songs repeated and no-repeated. For songs having length in (200000,300000), they are more likely to be repeated. For songs having length in (100000,200000), they are more liekly to listened unrepeatedly.*
+
+*So when fitting the model, we first choose it as a predictor and see whether it is significant.*
+
+####genre
+```{r,warning=FALSE}
+song_train_join %<>%
+  filter(genre_ids != "")
+song_validation_join %<>%
+  filter(genre_ids != "")
+g<-song_train_join %>%
+  group_by(genre_ids,target) %>%
+  summarise(count=n()) %>%
+  spread(key=target,value=count)
+colnames(g)<-c("genre_ids","target0","target1")
+na<-is.na(g)
+g[na[,2],2]<-0
+g[na[,3],3]<-0
+g_new<-g[,c(2,3)]
+chisq.test(g_new)
+
+g_p<-song_train_join %>%
+  group_by(genre_ids) %>%
+  mutate(count=n()) %>%
+  dplyr::filter(count>50000) %>%
+  summarise(p=mean(target)) %>%
+  arrange(desc(p))
+
+kable(g_p,caption = "Probability of songs listened repeatedly with genres")
+```
+
+*Through the chisquare test for "genre_ids" and "target", we can see that p-value<0.05, which means the two variables are correlated.*
+
+*Then we choose the genres occured more than 50000 times(data with more samples are more believable). From the table, we can see there is difference in probability of listening repeatedly between different genres. So "genre_ids" can be chosen as a predictor for target.*
+
+####Age
+```{r}
+load("member_song_train_join.RData")
+load("member_song_validation_join.RData")
+```
+```{r}
+library(gridExtra)
+p1<-ggplot(members_song_train_join,aes(x=target,y=bd,fill = target)) + stat_boxplot() + ylab("age") + xlab("target") + labs(caption = "original",tag = "fig.6")
+age_outliers<-boxplot.stats(members_song_train_join$bd)$out
+#age_outliers<-c(age_outliers,members_song_train_join$bd[members_song_train_join$bd<=6])
+#There are 1093376 observations in train data having outlier ages.
+
+#calculate the average age for target=0,1
+target_age<-members_song_train_join %>%
+  filter((!(bd %in% age_outliers)) & (bd>6)) %>%
+  group_by(target) %>%
+  summarise(ave_age=mean(bd))
+
+members_song_train_join$bd[((members_song_train_join$bd %in% age_outliers) | (members_song_train_join$bd<=6) )& (members_song_train_join$target=="0")]<-28.5
+members_song_train_join$bd[((members_song_train_join$bd %in% age_outliers) | (members_song_train_join$bd<=6) )& (members_song_train_join$target=="1")]<-27.9
+
+p2<-ggplot(members_song_train_join,aes(x=target,y=bd,fill=target)) + geom_boxplot() + ylab("age") + xlab("target") + labs(caption = " after replacing outliers",tag = "fig.7")
+grid.arrange(p1, p2, nrow = 1,name = "distribution of age")
+
+```
+*The left boxplot shows that there are outliers in age data, we use average age of each group to replace the outliers.*
+
+*After replacing outlier ages with average ages of two groups, the boxplot shows that older users  are less liekely to listen to a song repeatedly.*
+
+*So we could choose age as an predictor.*
+
+####city
+```{r}
+city<-members_song_train_join %>%
+  group_by(city,target) %>%
+  summarise(count=n()) %>%
+  mutate(all_count=sum(count)) %>%
+  mutate(p=count/all_count)
+  
+city_p <-city %>%
+  filter(target==1) %>%
+  dplyr::select(city,count,p) %>%
+  arrange(desc(p))
+ggplot(city) +
+  geom_bar(aes(x=city,y=p,fill=as.factor(target)),stat="Identity")+
+  labs(title="probability of repeated with city",tag = "fig.8") +
+  theme(axis.text.x = element_text(angle=60,vjust=0.5))
+
+kable(city_p,caption = "Probability of listening repeatedly with city")
+
+```
+
+*From the bar plot, city "16" "19" and "20" have extreme repeated probability compared with other cities. But from the table we notice that these cities only have 1596, 1066, 1667 observations, which is small compared to more than 200,0000 observations as totall. So we can say that data of these three cities are biased. Except for the three cities, other cities do not have significant difference in probability of songs repeated.* 
+
+*So I don't choose city as a predictor for target.*
+
+####number of genres a song have
+```{r}
+#number of genres a song have 
+members_song_train_join %<>%
+  mutate(n_genre=str_count(genre_ids,pattern = "\\|")+1)
+members_song_validation_join %<>%
+  mutate(n_genre=str_count(genre_ids,pattern = "\\|")+1)
+n_genre_p<-members_song_train_join %>%
+  group_by(n_genre,target) %>%
+  summarise(count=n()) %>%
+  mutate(all_count=sum(count)) %>%
+  mutate(p=count/all_count)
+
+#count observations number, for those n_genre data with small observations, the probability of song repeated is not believable
+genre_count<-members_song_train_join %>%
+  group_by(n_genre) %>%
+  summarise(count=n())
+kable(genre_count, caption = "size of data with same number of genres") 
+
+ggplot(n_genre_p %>% filter(!n_genre %in% c(5,6,7)),aes(x=n_genre,y=p,fill=as.factor(target))) +
+  geom_bar(stat="Identity") + 
+  labs(title="Probability of repeated with #genre",
+       x = "n_genre", 
+       y = "probability of listened repeatedly",
+       tag = "fig.9") + 
+  scale_fill_discrete(name="target")
+```
+*When n_genre=5,6,7, the result is not believable because of small sample size, so we remove them.*
+
+*The plot shows that the number of genres is likely to have negative relationship with the probability of song repeated.*
+
+####number of songs of an artist 
+
+```{r,warning=FALSE}
+members_song_train_join %<>%
+  group_by(artist_name) %>%
+  mutate(artist_playnum=n())
+members_song_validation_join %<>%
+  group_by(artist_name) %>%
+  mutate(artist_playnum=n())
+artist_playnum_p<-members_song_train_join %>% 
+  group_by(artist_playnum) %>%
+  mutate(p = mean(as.numeric(target)))
+
+ggplot(artist_playnum_p) + geom_point(aes(x=log(artist_playnum),y=p),color = "skyblue") +
+  labs(title = "Probability of listened repeated with artist plays number",
+       x = "number of plays of an artist",
+       y = "probability of repeated",
+       tag = "fig.10") 
+```
+*The plot shows that for songs whose artist has been played more times, the corresponding probability of the song repeated is bigger.*
+
+*Times a song played can be a predictor for target.*
+
+####Correlation between numeric variables
+```{r}
+library(GGally)
+cor_tst <- members_song_train_join %>%
+  ungroup() %>%
+  dplyr::select(song_played_times,song_length,artist_playnum,n_genre,bd) 
+ggpairs(cor_tst) + labs(title = "correlation,tags = fig.11")
+```
+*The correlation plot shows that the five numeric variables are not strong correlated, so I can choose them as my predictors.*
+
+##2.2 Model used
+
+###2.2.1 Model1(Logistic regression)
+
+I first choose "msno","source_system_tab","genre_ids","song_played_times","song_length","artist_playnum","bd"(age),"n_genre" as predictors. 
+
+Because the sample size is too big for fitting a linear regression, I sampled songs history data of 100 users, including 22116 observations.  
+
+model1:glm(target ~ 1 + msno + log(song_played_times)  + scale(song_length) +log(artist_playnum) + genre_ids + n_genre + scale(bd) + source_system_tab , data = members_song_train_join,  family = binomial(link = "logit"))
+```{r}
+library(lme4)
+library(arm)
+members_song_train_join$target<-as.numeric(members_song_train_join$target)
+a<-members_song_train_join %>%
+  group_by(msno) %>%
+  summarise(count = n()) %>%
+  filter(count>=100)
+set.seed(2018)
+user<-sample(a$msno,100,replace=FALSE)
+
+test<-members_song_validation_join %>%
+  filter(msno %in% user)
+test$bd[((test$bd %in% age_outliers) | (test$bd<=6) )& (test$target=="0")]<-28.5
+test$bd[((test$bd %in% age_outliers) | (test$bd<=6) )& (test$target=="1")]<-27.9
+
+members_song_train_join %<>%
+  filter(msno %in% user)
+
+test$target<-as.numeric(test$target)
+#save(test,file="test.RData")
+#save(members_song_train_join,file="final_train_data.RData")
+
+m1 <- glm(target ~ 1 + msno + log(song_played_times)  + scale(song_length) +log(artist_playnum) + genre_ids + n_genre + scale(bd) + source_system_tab , data = members_song_train_join,  family = binomial(link = "logit"))
+#summary(m1)
+#binnedplot(fitted(m1),resid(m1,type="response"))
+```
+After fitting the model, it has a warning:"glm.fit: fitted probabilities numerically 0 or 1 occurred", which means that the model overfitted, or there is some variable significantly determined the response. 
+
+In order to fix it, I drop some features and fitted model2.
+
+###2.2.2 Model2(Imporoved version of Model1)
+
+Becasue "n_genre" is estimated as NA in model1, which means that it has colinear relationship with other vriables. Considering that
+"genre_ids" also is a predictor and contains overlapping information with "n_genre"(number of genre for a song). So I first drop this feature. 
+```{r}
+ggplot(members_song_train_join, aes(x=bd)) +  
+  geom_density(aes(color=as.factor(target))) +
+  labs(title = "age distribution",
+       x = "age",
+       y = "density", 
+       tag = "fig.12") + 
+  scale_color_discrete(name="target")
+
+```
+From the age distribution, we can see that the probability of listening repeatedly is not linear related with age. Though I tried several polynomial format for age, it still have the same warning.
+
+Then I try to figure out if there is colinear relationship between age and other variables.
+```{r}
+popular_genres<-members_song_train_join %>%
+  group_by(genre_ids) %>%
+  summarise(occur_times = n()) %>%
+  arrange(desc(occur_times)) %>%
+  top_n(10,occur_times)
+ggplot(members_song_train_join %>% filter(genre_ids %in% popular_genres$genre_ids)) + 
+  geom_boxplot(aes(x=genre_ids,y=bd,color = genre_ids)) +
+  labs(title = "top 10 popular genres with age",
+       x = "genre_ids",
+       y = "age",
+       tag = "fig.13") + 
+  theme(axis.text.x = element_text(angle=60,vjust=0.5))
+```
+From this box plot we can see that different genre_ids have diffenrent scale of age of main audience. 
+
+Considering the above 2 aspects, I drop "bd"(age) feature, and build model2.
+
+Model2: glm(target ~ 1 + msno + log(song_played_times)  + scale(song_length) +log(artist_playnum) + genre_ids  + source_system_tab , data = members_song_train_join,  family = binomial(link = "logit"))
+```{r}
+m2 <- glm(target ~ 1 + msno + log(song_played_times)  + scale(song_length) +log(artist_playnum) + genre_ids  + source_system_tab , data = members_song_train_join,  family = binomial(link = "logit"))
+#summary(m2)
+#binnedplot(fitted(m2),resid(m2,type="response"))
+```
+
+###2.2.3 Model3(Multilevel Logistic regression)
+
+From the EDA part we can know that users have different preference. So I choose "msno"(user_id) as a group variable, building a intercept-varying model with "song_played_times","song_length","artist_playnum",
+"source_system_tab" as predictors.(add other variables will lead the model to unconverging.)
+
+Model3: glmer(target ~ (1|msno)  + log(song_played_times) + scale(song_length) + scale(artist_playnum) + source_system_tab, data = members_song_train_join,  family = binomial(link = "logit"))
+```{r}
+m_multilevel <- glmer(target ~ (1|msno)  + log(song_played_times) + scale(song_length) + scale(artist_playnum) + source_system_tab, data = members_song_train_join,  family = binomial(link = "logit"))
+
+#binnedplot(fitted(m_multilevel),resid(m_multilevel, type="response"))
+#summary(m_multilevel)
+```
+#3. Result
+##3.1 Model choice
+###3.1.1 Model2
+```{r}
+binnedplot(fitted(m2),resid(m2, type="response"),main = "Binned residual plot for model2")
+#summary(m2)
+```
+
+* song_played_times, several levels in source_system_tab("explore","library","radio","search"), several levels in genre_ids, and several levels in msno(user_id) are significant. 
+
+* log(song_played_times) has coefficient 0.217, which is consistant with EDA result--songs played more times are more likely to be listened repeatedly. 
+
+* scale(song_length) has coefficient -0.0046. it means longer songs have lower probability to be listened repeatedly. which is not consistant with EDA result.
+
+* log(artist_playnum) has coefficient 0.00016, which is consistant with EDA result--songs whose artist is played more times are more likely to be listened repeatedly. 
+
+* Null deviance: 30214  on 22115  degrees of freedom.
+Residual deviance: 24760  on 21937  degrees of freedom
+
+* AIC: 25116
+
+###3.1.2 Model3(Multilevel)
+```{r}
+binnedplot(fitted(m_multilevel),resid(m_multilevel, type="response"),main = "Binned residual plot for m_multilevel")
+```
+
+* AIC = 25370, deviance = 25348. both bigger than model2.
+
+* The residual plot is better than model2, cause points beyond the CI is less.
+
+###3.1.3 Comparison
+
+* From AIC aspect, model2 is better cause it has the least AIC,
+
+* From deviance aspect, also model2 is better cause it has the least residual deviance.
+
+* From residual plot, multilevel model looks better.
+
+We need to use test set to see which model has better classification ability.
+
+##3.2 Model checking
+###3.2.1 Model2
+```{r}
+#test
+test %<>% filter(genre_ids %in% members_song_train_join$genre_ids)
+library(caret)
+library(e1071)
+m2.predict<-predict(m2,test,type="response")
+m2.predict<-ifelse(m2.predict>0.5,1,0)
+m2.predict<-as.factor(m2.predict)
+confusionMatrix(m2.predict,as.factor(test$target))
+```
+```{r}
+library(pROC)
+rocCurve <- roc(response = test$target, predictor = as.numeric(m2.predict))
+plot(rocCurve, legacy.axes = TRUE,print.auc=TRUE, auc.polygon=TRUE, 
+     grid=c(0.1, 0.2),grid.col=c("green", "red"), max.auc.polygon=TRUE,
+     auc.polygon.col="cornsilk", print.thres=TRUE,
+     main = "ROC for model2")
+```
+
+###3.2.2 Multilevel model
+```{r}
+multilevel.predict<-predict(m_multilevel,test,type="response")
+multilevel.predict<-ifelse(multilevel.predict>0.5,1,0)
+multilevel.predict<-as.factor(multilevel.predict)
+confusionMatrix(multilevel.predict,as.factor(test$target))
+```
+```{r}
+rocCurve <- roc(response = test$target, predictor = as.numeric(multilevel.predict))
+plot(rocCurve, legacy.axes = TRUE,print.auc=TRUE, auc.polygon=TRUE, 
+     grid=c(0.1, 0.2),grid.col=c("green", "red"), max.auc.polygon=TRUE,
+     auc.polygon.col="cornsilk", print.thres=TRUE,
+     main = "ROC for m_multilevel")
+```
+
+* From the ROC plots and confusionmatrix, we can see that ,model2 and multilevel model is similar.
+
+* The feature "genre_ids" seems no contribution to the classification power.
+
+##3.3 Interpretation
+Because the two models do not have significant different result, we just interpret the multilevel model.
+```{r}
+display(m_multilevel)
+ranef(m_multilevel)
+```
+* Different users have different intercepts. With bigger intercept, the log odds of this song being listened repeatedly by this user is bigger.
+
+* With song_played_times increasing e times, the log odds of a song listened repeatedly increases 0.22
+
+* With song_length increasing by sd(song_length), the log odds of a song listened repeatedly decreases 0.01.
+
+* With artist_playnum increasing by sd(artist_playnum), the long odds of a song listened repeatedly increases 0.02.
+
+* Songs played on different “source_system_tab” have different probabilities to be listened repeatedly. Songs played on “my library” has the biggest repeated log odds, while songs played on “radio” has the smallest repeated log odds.
+
+#4. Discussion
+##4.1 Implication
+* In common sense, the time a song played represents the popularity of this song. And it's reasonable for a popular song to be listened repeatedly. From the result of the multilevel model, we can see the more times a song played, the more probable it will be listened repeatedly, which is consist to our common sense. So we can recommend popular songs to users.
+
+* Song length have little influence on whether the song will be listened repeatedly or not. Longer songs are slightly less likely to be listened repeatedly. As a result, though length is not a main aspect, songs with too long length should not be significantly recommended.
+
+* Source tab "my libary" is a group including all songs this user has listened in the past. So it is reasonable that the users prefer to listen to songs which has been listened before for more times.
+
+##4.2 Limitation
+* New levels for categorical variables: Linear regression is sensible to new levels not occuring in fitting data, but this situation is common in real life. For example, I want to know if a new user(without history data but only demographic data) will listen to a song repeatedly, but I don't have the user_id in my data fitting the model, so I cannot do predict by linear regression. But in real situation, there are always new users and new songs occure.
+
+* Missing values: For one observation, if only one variable has missing value, the whole observation need to be removed, or using other values(like mean) to replace the NA, both will decrease the accuracy of the model. 
+
+* Calculation: With categorical variables including a lot of levels, the linear regression is always lack of memory to calculate(Though the observations are only around 20000). So some features like "lyricist" and "artist" could not add into the model.
+
+##4.3 Future direction
+Using machine learning algorithm like XGboost to figure out the missing value and new levels problems.
+
+#5. Acknowledgement
+I would like to express my thanks to Professor Masanao for his assistance and patience with me and my model. And also thanks my friends for giving me many ideas on plots.
+
+
+
